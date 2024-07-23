@@ -1,0 +1,12 @@
+If you want to connect through Every PCS, Every pcs must be interconnect with 'Bridge'.
+To do this, u must have to add in the mosquitto.conf file
+
+_______________________________________
+
+listener 1883 0.0.0.0
+
+connection bridge_to_pc1
+address 172.16.2.97 #Another pc ip
+
+topic # both 0
+
