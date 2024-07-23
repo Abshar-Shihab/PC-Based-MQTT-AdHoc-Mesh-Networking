@@ -1,0 +1,42 @@
+First open cmd as administrator, go to the mosquitto directory
+cd C:\Program Files\mosquitto
+
+Then start it by
+net start mosquitto
+
+if u want to check the connectivity 
+netstat -a   ---> ensure that 1883 port is listening
+
+
+First of all config the file to connect the different pcs
+so fisrt stop if the mosquitto runs using this command
+net stop mosquitto
+
+then, open the mosquitto.conf file in mosquitto diretory and go to the LISTENERS part
+uncommand the last line of listern and include this
+listener 1883 0.0.0.0
+
+
+after that go to the SECURITY topic, #allow_anonymous false -----> we have to change it below
+allow_anonymous true
+
+and save it in the config and again run the mosquitto
+
+
+Before all these things, you have to open a port to listen in windows firewall
+so that, Open the Run (wind+R) and type 
+wf.msc
+
+and go to the inbound, select port, give the port number 1883, and give the name
+do the same thing for outbound also.
+
+
+open another terminal for subcriber and enter this
+mosquitto_sub -t test_sensor_data -h localhost		------> change locahost with ipaddr
+
+
+another PC, start the mosquitto and run this command for publisher
+mosquitto_pub -t test_sensor_data -h 172.16.2.106 -m "temp:100"
+
+
+now both pcs are connected
