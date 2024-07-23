@@ -1,7 +1,3 @@
-Certainly! Here's a draft for your `README.md` file for the "PC-Based-MQTT-AdHoc-Mesh-Networking" project on GitHub:
-
----
-
 # PC-Based MQTT AdHoc Mesh Networking
 
 ## Project Overview
