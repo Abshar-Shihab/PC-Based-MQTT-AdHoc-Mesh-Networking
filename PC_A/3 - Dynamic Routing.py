@@ -24,6 +24,13 @@ def broadcast_presence():
             print(f"Broadcasting presence: {NODE_NAME}")
         time.sleep(10)  # Broadcast every 10 seconds
 
+# Periodically broadcast connections
+def broadcast_connections_periodically():
+    while True:
+        time.sleep(30)  # Broadcast every 30 seconds
+        client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
+        print(f"Broadcasting connections for node {NODE_NAME}")
+
 # Function to broadcast a reset command to all nodes
 def broadcast_reset():
     client.publish('reset', 'RESET_COMMAND')
@@ -44,6 +51,8 @@ def handle_connection_acknowledgment(sender):
         accepted_connections[NODE_NAME].add(sender)
         accepted_connections[sender].add(NODE_NAME)
         print(f"Connection with {sender} is now finalized")
+        # Request connection list from newly connected node
+        client.publish(f"connections_request/{sender}", NODE_NAME)
     else:
         print(f"Unexpected acknowledgment from {sender}")
 
@@ -52,6 +61,12 @@ def on_message(client, userdata, msg):
     global NEIGHBORS, latencies, connection_slots, accepted_connections, connections_list
     topic_parts = msg.topic.split('/')
 
+    # Check if the message is from the node itself
+    if msg.payload.decode().startswith(NODE_NAME + ":"):
+        print(f"Ignoring loopback message: {msg.payload.decode()}")
+        return
+
+    payload = msg.payload.decode()
     if msg.topic == 'reset':
         print(f"Received reset command. Resetting connections...")
         reset_connections()
@@ -72,13 +87,14 @@ def on_message(client, userdata, msg):
         if len(NEIGHBORS) < MAX_CONNECTIONS and new_neighbor not in NEIGHBORS:
             if connection_slots[new_neighbor] > 0:
                 NEIGHBORS.add(new_neighbor)
-                connection_slots[new_neighbor] -= 1  # Decrease the connection slot count for the new neighbor
-                connection_slots[NODE_NAME] -= 1  # Decrease the connection slot count for the current node
-                accepted_connections[NODE_NAME].add(new_neighbor)  # Add to accepted connections
-                accepted_connections[new_neighbor].add(NODE_NAME)  # Mutual connection
+                connection_slots[new_neighbor] -= 1
+                connection_slots[NODE_NAME] -= 1
+                accepted_connections[NODE_NAME].add(new_neighbor)
+                accepted_connections[new_neighbor].add(NODE_NAME)
                 print(f"Discovered neighbor: {new_neighbor}")
-                # Measure latency with new neighbor
                 measure_latency(new_neighbor)
+                client.publish(f"connections_request/{new_neighbor}", NODE_NAME)
+                client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
             else:
                 print(f"Neighbor {new_neighbor} has reached its connection limit.")
         else:
@@ -87,50 +103,64 @@ def on_message(client, userdata, msg):
         disconnected_node = msg.payload.decode()
         if disconnected_node in NEIGHBORS:
             NEIGHBORS.remove(disconnected_node)
-            connection_slots[disconnected_node] += 1  # Restore connection slot for the disconnected node
-            accepted_connections[disconnected_node].remove(
-                NODE_NAME)  # Remove from accepted connections of the disconnected node
+            connection_slots[disconnected_node] += 1
+            accepted_connections[disconnected_node].remove(NODE_NAME)
             print(f"Disconnected from {disconnected_node}")
+            client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
     elif topic_parts[0] == 'ack_request' and topic_parts[1] == NODE_NAME:
         handle_connection_acknowledgment(msg.payload.decode())
     elif msg.topic == 'disconnect/all':
         handle_gateway_disconnection(msg.payload.decode())
     elif topic_parts[0] == 'connections' and topic_parts[1] == NODE_NAME:
-        # Receiving connection list from other nodes
         node, connections = msg.payload.decode().split(':', 1)
         connections_list[node] = connections.split(',')
         print(f"Received connections list from {node}: {connections_list[node]}")
+    elif topic_parts[0] == 'connections_request' and topic_parts[1] == NODE_NAME:
+        client.publish(f"connections/{msg.payload.decode()}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
     else:
-        payload = msg.payload.decode()
         if ':' in payload:
-            sender, content = payload.split(':', 1)  # Split into sender and content
+            parts = payload.split(':', 2)
+            sender = parts[0]
+            message = parts[1]
+            path_info = parts[2] if len(parts) > 2 else "NoPath"
             if NODE_NAME == GATEWAY_NODE:
-                print(f"Gateway received message from {sender}: {content}")
-                # Reset connections after receiving a message
+                print(f"Gateway received message from {sender}: {message} with path {path_info}")
                 reset_connections()
-                # Broadcast reset command to other nodes
                 broadcast_reset()
             else:
-                print(f"Received message from {sender}: {content} on topic {msg.topic}")
-                forward_message(client, sender, content)
+                print(f"Received message from {sender}: {message} with path {path_info} on topic {msg.topic}")
+                forward_message(client, sender, message)
         else:
             print(f"Received malformed message: {payload}")
 
+
+
 # Function to forward messages based on the shortest path using Dijkstra's algorithm
 def forward_message(client, sender, message):
-    path = dijkstra(latencies, NODE_NAME, GATEWAY_NODE)
-    if path and len(path) > 1:
-        next_hop = path[1]
-        client.publish(next_hop, f"{NODE_NAME}:{message}")
-        print(f"Sent message to {next_hop} (part of path to {GATEWAY_NODE})")
+    if GATEWAY_NODE in accepted_connections[NODE_NAME]:
+        # Path is empty when sending directly to the gateway
+        client.publish(GATEWAY_NODE, f"{NODE_NAME}:{message}:Path:")
+        print(f"Directly sent message to Gateway {GATEWAY_NODE} with path info")
     else:
-        # Forward to the closest neighbor if no path to gateway is found
-        closest_neighbor = find_closest_neighbor()
-        if closest_neighbor:
-            client.publish(closest_neighbor, f"{NODE_NAME}:{message}")
-            print(f"Sent message to closest neighbor {closest_neighbor} as fallback")
+        path = dijkstra(latencies, NODE_NAME, GATEWAY_NODE)
+        if path and len(path) > 0:
+            next_hop = path[1]
+            path_info = "->".join(path)
+            client.publish(next_hop, f"{NODE_NAME}:{message}:Path:{path_info}")
+            print(f"Sent message to {next_hop} (part of path to {GATEWAY_NODE}) with path info")
+            # Request connection list from next hop
+            client.publish(f"connections_request/{next_hop}", NODE_NAME)
         else:
-            print(f"No path to gateway from {NODE_NAME} and no fallback neighbor found.")
+            # Forward to the closest neighbor if no path to gateway is found
+            closest_neighbor = find_closest_neighbor()
+            if closest_neighbor:
+                client.publish(closest_neighbor, f"{NODE_NAME}:{message}:Path:NoPath")
+                print(f"Sent message to closest neighbor {closest_neighbor} as fallback with path info")
+                # Request connection list from closest neighbor
+                client.publish(f"connections_request/{closest_neighbor}", NODE_NAME)
+            else:
+                print(f"No path to gateway from {NODE_NAME} and no fallback neighbor found.")
+
 
 def find_closest_neighbor():
     min_latency = float('inf')
@@ -174,6 +204,7 @@ client.subscribe((NODE_NAME, 0))
 client.subscribe(('reset', 0))
 client.subscribe((f"ack_request/{NODE_NAME}", 0))
 client.subscribe((f"connections/{NODE_NAME}", 0))
+client.subscribe((f"connections_request/{NODE_NAME}", 0))
 if NODE_NAME == GATEWAY_NODE:
     client.subscribe((GATEWAY_NODE, 0))
 
@@ -208,9 +239,15 @@ def handle_gateway_disconnection(node):
         connection_slots[node] += 1
         accepted_connections[node].remove(NODE_NAME)
         print(f"Removed {node} from connections due to gateway disconnection.")
+        # Broadcast connections after removal
+        client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
 
 # Function to send messages from the sender node
 def send_messages():
+    # Broadcast reset command on startup
+    broadcast_reset()
+    time.sleep(2)  # Allow time for nodes to reset their connections
+
     while True:
         message = input("Enter message to send (or 'show' to display connections, 'exit' to quit): ")
         if message.lower() == 'exit':
@@ -223,8 +260,7 @@ def send_messages():
             time.sleep(2)  # Allow time for nodes to connect and measure latency
 
             # Each node sends its connection list to the messaging node
-            for neighbor in NEIGHBORS:
-                client.publish(f"connections/{neighbor}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
+            client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
 
             time.sleep(2)  # Allow time for connection lists to be received
 
@@ -280,6 +316,10 @@ send_messages_thread.start()
 broadcast_thread = threading.Thread(target=broadcast_presence)
 broadcast_thread.start()
 
+# Start the periodic connections broadcasting in a separate thread
+connections_broadcast_thread = threading.Thread(target=broadcast_connections_periodically)
+connections_broadcast_thread.start()
+
 # Keep the script running
 try:
     while True:
@@ -289,4 +329,5 @@ except KeyboardInterrupt:
     client.disconnect()
     send_messages_thread.join()
     broadcast_thread.join()
-    print("Disconnected from MQTT broker.")
+    connections_broadcast_thread.join()
+    print("Disconnected from MQTT broker.")
