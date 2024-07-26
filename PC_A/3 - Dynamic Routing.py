@@ -6,9 +6,9 @@ from collections import defaultdict
 import json
 
 # Configuration
-BROKER_IP = '172.16.2.106'  # Local broker IP
+BROKER_IP = '172.16.2.100'  # Local broker IP
 DISCOVERY_TOPIC = 'discovery'
-NODE_NAME = 'S'  # Change this for each node ('D', 'S', 'N', 'K')
+NODE_NAME = 'K'  # Change this for each node ('D', 'S', 'N', 'K')
 GATEWAY_NODE = 'N'  # Specify the gateway node here
 NEIGHBORS = set()
 latencies = defaultdict(dict)
