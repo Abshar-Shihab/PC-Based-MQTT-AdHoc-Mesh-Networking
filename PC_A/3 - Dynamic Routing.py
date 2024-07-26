@@ -3,19 +3,20 @@ import threading
 import time
 import heapq
 from collections import defaultdict
+import json
 
 # Configuration
-BROKER_IP = '172.16.2.100'  # Local broker IP
+BROKER_IP = '172.16.2.106'  # Local broker IP
 DISCOVERY_TOPIC = 'discovery'
-NODE_NAME = 'K'  # Change this for each node ('D', 'S', 'N', 'K')
+NODE_NAME = 'S'  # Change this for each node ('D', 'S', 'N', 'K')
 GATEWAY_NODE = 'N'  # Specify the gateway node here
 NEIGHBORS = set()
 latencies = defaultdict(dict)
-MAX_CONNECTIONS = 2  # Maximum number of connections per node
+MAX_CONNECTIONS = 3  # Maximum number of connections per node
 connection_slots = defaultdict(lambda: MAX_CONNECTIONS)  # Track available connection slots for each node
 accepted_connections = defaultdict(set)  # Track accepted connections for each node
 connections_list = defaultdict(list)  # List to store connections for each node
-
+latency2=0
 # Periodically broadcast presence for neighbor discovery
 def broadcast_presence():
     while True:
@@ -25,11 +26,53 @@ def broadcast_presence():
         time.sleep(10)  # Broadcast every 10 seconds
 
 # Periodically broadcast connections
+# Periodically broadcast connections
 def broadcast_connections_periodically():
     while True:
-        time.sleep(30)  # Broadcast every 30 seconds
-        client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
-        print(f"Broadcasting connections for node {NODE_NAME}")
+        time.sleep(600)  # Wait before broadcasting connections
+
+        # Ensure that latency measurements are completed
+        print("Waiting for latency updates...")
+        time.sleep(5)  # Additional wait to ensure latencies are updated
+
+        # Construct connection info with latency
+        connections_info = [f"{node}:{latencies[NODE_NAME].get(node, 'N/A')}" for node in accepted_connections[NODE_NAME]]
+        client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(connections_info)}")
+        print(f"Broadcasting connections with latency for node {NODE_NAME}")
+
+        # Wait for additional time to allow all nodes to process the broadcast
+        time.sleep(5)
+
+
+# Function to add a connection to the local connections list
+def add_local_connection(neighbor, latency):
+    if neighbor not in accepted_connections[NODE_NAME]:
+        accepted_connections[NODE_NAME].add(neighbor)
+        accepted_connections[neighbor].add(NODE_NAME)
+        latencies[NODE_NAME][neighbor] = latency
+        latencies[neighbor][NODE_NAME] = latency
+        connections_list[NODE_NAME].append((neighbor, latency))
+        connections_list[neighbor].append((NODE_NAME, latency))
+        print(f"Added connection with {neighbor} with latency {latency}")
+    else:
+        print(f"Connection with {neighbor} already exists")
+
+# Function to handle new connections and update lists
+def handle_new_connection(neighbor, latency):
+    if len(NEIGHBORS) < MAX_CONNECTIONS and neighbor not in NEIGHBORS:
+        if connection_slots[neighbor] > 0:
+            NEIGHBORS.add(neighbor)
+            connection_slots[neighbor] -= 1
+            connection_slots[NODE_NAME] -= 1
+            add_local_connection(neighbor, latency)
+            # Request connection list from newly connected node
+            client.publish(f"connections_request/{neighbor}", NODE_NAME)
+            client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join([f'{n}:{latencies[NODE_NAME].get(n, 'N/A')}' for n in accepted_connections[NODE_NAME]])}")
+        else:
+            print(f"Neighbor {neighbor} has reached its connection limit.")
+    else:
+        print(f"Already connected to maximum neighbors or neighbor {neighbor} is already connected.")
+
 
 # Function to broadcast a reset command to all nodes
 def broadcast_reset():
@@ -40,7 +83,9 @@ def broadcast_reset():
 def measure_latency(neighbor):
     start_time = time.time()
     client.publish(f"ping/{neighbor}", f"{NODE_NAME}:{start_time}")
+    print(f"Measuring latency to {neighbor}.")
     return start_time
+
 
 def request_connection_acknowledgment(neighbor):
     client.publish(f"ack_request/{neighbor}", NODE_NAME)
@@ -61,20 +106,36 @@ def on_message(client, userdata, msg):
     global NEIGHBORS, latencies, connection_slots, accepted_connections, connections_list
     topic_parts = msg.topic.split('/')
 
-    # Check if the message is from the node itself
     if msg.payload.decode().startswith(NODE_NAME + ":"):
         print(f"Ignoring loopback message: {msg.payload.decode()}")
         return
 
     payload = msg.payload.decode()
-    if msg.topic == 'reset':
-        print(f"Received reset command. Resetting connections...")
-        reset_connections()
-        return
 
-    if topic_parts[0] == 'ping' and topic_parts[1] == NODE_NAME:
-        client.publish(f"pong/{msg.payload.decode().split(':')[0]}",
-                       f"{NODE_NAME}:{msg.payload.decode().split(':')[1]}")
+    if topic_parts[0] == 'connections' and topic_parts[1] == NODE_NAME:
+        node, connections_info = payload.split(':', 1)
+        connections_list[node] = []
+        for info in connections_info.split(','):
+            if ':' in info:
+                parts = info.split(':')
+                if len(parts) == 2:
+                    neighbor, latency = parts
+                    try:
+                        latency = float(latency)
+                        connections_list[node].append((neighbor, latency))
+                        latencies[node][neighbor] = latency
+                        latencies[neighbor][node] = latency
+                    except ValueError:
+                        print(f"Warning: Invalid latency value: {latency}")
+                else:
+                    print(f"Warning: Info string does not contain exactly two parts separated by ':': {info}")
+            else:
+                print(f"Warning: Info string does not contain ':': {info}")
+        print(f"Received connections list with latency from {node}: {connections_list[node]}")
+        save_connections_to_file()
+
+    elif topic_parts[0] == 'ping' and topic_parts[1] == NODE_NAME:
+        client.publish(f"pong/{msg.payload.decode().split(':')[0]}", f"{NODE_NAME}:{msg.payload.decode().split(':')[1]}")
         print(f"Responded to ping from {msg.payload.decode().split(':')[0]}")
     elif topic_parts[0] == 'pong' and topic_parts[1] == NODE_NAME:
         latency = time.time() - float(msg.payload.decode().split(":")[1])
@@ -82,23 +143,12 @@ def on_message(client, userdata, msg):
         latencies[NODE_NAME][sender] = latency
         latencies[sender][NODE_NAME] = latency
         print(f"Measured latency to {sender}: {latency:.4f} seconds")
+        handle_new_connection(sender, latency)
     elif msg.topic == DISCOVERY_TOPIC and msg.payload.decode() != NODE_NAME:
         new_neighbor = msg.payload.decode()
-        if len(NEIGHBORS) < MAX_CONNECTIONS and new_neighbor not in NEIGHBORS:
-            if connection_slots[new_neighbor] > 0:
-                NEIGHBORS.add(new_neighbor)
-                connection_slots[new_neighbor] -= 1
-                connection_slots[NODE_NAME] -= 1
-                accepted_connections[NODE_NAME].add(new_neighbor)
-                accepted_connections[new_neighbor].add(NODE_NAME)
-                print(f"Discovered neighbor: {new_neighbor}")
-                measure_latency(new_neighbor)
-                client.publish(f"connections_request/{new_neighbor}", NODE_NAME)
-                client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
-            else:
-                print(f"Neighbor {new_neighbor} has reached its connection limit.")
-        else:
-            print(f"Already connected to maximum neighbors or neighbor {new_neighbor} is already connected.")
+        if new_neighbor not in accepted_connections[NODE_NAME]:
+            start_time = measure_latency(new_neighbor)
+
     elif topic_parts[0] == 'disconnect' and topic_parts[1] == NODE_NAME:
         disconnected_node = msg.payload.decode()
         if disconnected_node in NEIGHBORS:
@@ -106,17 +156,14 @@ def on_message(client, userdata, msg):
             connection_slots[disconnected_node] += 1
             accepted_connections[disconnected_node].remove(NODE_NAME)
             print(f"Disconnected from {disconnected_node}")
-            client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
+            client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join([f'{n}:{latencies[NODE_NAME].get(n, 'N/A')}' for n in accepted_connections[NODE_NAME]])}")
     elif topic_parts[0] == 'ack_request' and topic_parts[1] == NODE_NAME:
         handle_connection_acknowledgment(msg.payload.decode())
     elif msg.topic == 'disconnect/all':
         handle_gateway_disconnection(msg.payload.decode())
-    elif topic_parts[0] == 'connections' and topic_parts[1] == NODE_NAME:
-        node, connections = msg.payload.decode().split(':', 1)
-        connections_list[node] = connections.split(',')
-        print(f"Received connections list from {node}: {connections_list[node]}")
     elif topic_parts[0] == 'connections_request' and topic_parts[1] == NODE_NAME:
-        client.publish(f"connections/{msg.payload.decode()}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
+        connections_info = [f"{node}:{latencies[NODE_NAME].get(node, 'N/A')}" for node in accepted_connections[NODE_NAME]]
+        client.publish(f"connections/{msg.payload.decode()}", f"{NODE_NAME}:{','.join(connections_info)}")
     else:
         if ':' in payload:
             parts = payload.split(':', 2)
@@ -132,6 +179,8 @@ def on_message(client, userdata, msg):
                 forward_message(client, sender, message)
         else:
             print(f"Received malformed message: {payload}")
+
+
 
 
 
@@ -189,6 +238,13 @@ def dijkstra(graph, start, end):
                 heapq.heappush(queue, (cost + weight, next_node, path))
     return None
 
+# Save connections list to a file
+def save_connections_to_file():
+    with open('connections_list.json', 'w') as f:
+        json.dump(connections_list, f, indent=4)
+    print("Saved connections list with latency to 'connections_list.json'")
+
+
 # Set up the MQTT client
 client = mqtt.Client()
 client.on_message = on_message
@@ -197,14 +253,14 @@ client.on_message = on_message
 client.connect(BROKER_IP, 1883, 60)
 
 # Subscribe to discovery, latency, and node-specific topics
-client.subscribe((DISCOVERY_TOPIC, 0))
-client.subscribe((f"ping/{NODE_NAME}", 0))
-client.subscribe((f"pong/{NODE_NAME}", 0))
-client.subscribe((NODE_NAME, 0))
-client.subscribe(('reset', 0))
-client.subscribe((f"ack_request/{NODE_NAME}", 0))
-client.subscribe((f"connections/{NODE_NAME}", 0))
-client.subscribe((f"connections_request/{NODE_NAME}", 0))
+client.subscribe((DISCOVERY_TOPIC, 1))
+client.subscribe((f"ping/{NODE_NAME}", 1))
+client.subscribe((f"pong/{NODE_NAME}", 1))
+client.subscribe((NODE_NAME, 1))
+client.subscribe(('reset', 1))
+client.subscribe((f"ack_request/{NODE_NAME}", 1))
+client.subscribe((f"connections/{NODE_NAME}", 1))
+client.subscribe((f"connections_request/{NODE_NAME}", 1))
 if NODE_NAME == GATEWAY_NODE:
     client.subscribe((GATEWAY_NODE, 0))
 
@@ -218,10 +274,10 @@ def reset_connections():
         client.publish(f"disconnect/{neighbor}", NODE_NAME)
         print(f"Notified {neighbor} about disconnection.")
 
-    if NODE_NAME == GATEWAY_NODE:
-        client.publish('disconnect/all', NODE_NAME)
-        print(f"Gateway Node {NODE_NAME} has announced its departure.")
+    client.publish('disconnect/all', NODE_NAME)
+    print(f"Gateway Node {NODE_NAME} has announced its departure.")
 
+    # Reset local connection lists
     NEIGHBORS = set()
     latencies = defaultdict(dict)
     connection_slots[NODE_NAME] = MAX_CONNECTIONS
@@ -229,8 +285,15 @@ def reset_connections():
         connection_slots[neighbor] += 1
     accepted_connections[NODE_NAME] = set()
     connections_list = defaultdict(list)  # Reset connections list
+
+    # Broadcast presence to allow reconnection
     client.publish(DISCOVERY_TOPIC, NODE_NAME)
+    print("Reset connections and broadcasting presence.")
+
+    # Allow time for all nodes to reset and reconnect
     time.sleep(1)
+
+
 
 # Handle the disconnection announcement from the gateway
 def handle_gateway_disconnection(node):
@@ -259,10 +322,9 @@ def send_messages():
             broadcast_presence_once()
             time.sleep(2)  # Allow time for nodes to connect and measure latency
 
-            # Each node sends its connection list to the messaging node
-            client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
-
-            time.sleep(2)  # Allow time for connection lists to be received
+            # Wait for latency updates before checking path
+            print("Waiting for latency updates...")
+            time.sleep(5)  # Allow additional time for latency updates
 
             # Check once if a path to the gateway exists
             print("Checking for a path to the gateway...")
@@ -285,6 +347,8 @@ def send_messages():
             # Reset connections after sending the message
             reset_connections()
             print("Reset connections after sending the message.")
+
+
 
 def broadcast_presence_once():
     if connection_slots[NODE_NAME] > 0:
