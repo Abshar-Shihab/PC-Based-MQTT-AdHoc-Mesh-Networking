@@ -8,7 +8,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 
 # Configuration
-BROKER_IP = '172.16.2.100'  # Local broker IP
+BROKER_IP = '172.16.2.217'  # Local broker IP
 DISCOVERY_TOPIC = 'discovery'
 NODE_NAME = 'K'  # Change this for each node ('D', 'S', 'N', 'K')
 GATEWAY_NODE = 'N'  # Specify the gateway node here
@@ -18,7 +18,12 @@ MAX_CONNECTIONS = 2  # Maximum number of connections per node
 connection_slots = defaultdict(lambda: MAX_CONNECTIONS)  # Track available connection slots for each node
 accepted_connections = defaultdict(set)  # Track accepted connections for each node
 connections_list = defaultdict(list)  # List to store connections for each node
-latency2 = 0
+next_hop = None
+
+
+# Define a global layout for node positions
+def get_fixed_layout(G):
+    return nx.spring_layout(G, seed=42)  # Use a seed for reproducible positions
 
 
 # Periodically broadcast presence for neighbor discovery
@@ -36,41 +41,16 @@ def load_connections_from_json(file_path):
     return connections
 
 
-def display_network_graph(connections_list):
-    # Create a new directed graph
-    G = nx.DiGraph()
-
-    # Add nodes and edges with latencies as edge labels
-    for node, connections in connections_list.items():
-        G.add_node(node)
-        for neighbor, latency in connections:
-            if G.has_edge(neighbor, node):
-                # Mark bidirectional edges
-                G[neighbor][node]['bidirectional'] = True
-            else:
-                G.add_edge(node, neighbor, weight=latency, label=f"{latency:.2f} ms", bidirectional=False)
-
-    # Set node colors
-    node_colors = []
-    for node in G.nodes():
-        if node == GATEWAY_NODE:
-            node_colors.append('red')  # Gateway node in red
-        else:
-            node_colors.append('blue')  # Other nodes in blue
-
-    # Use a fixed seed for reproducible layout positions
-    pos = nx.spring_layout(G, seed=42)  # Set a seed for reproducible positions
-
+def display_network_graph(G, pos, shortest_path_edges=None):
     # Draw the network graph
-    nx.draw(G, pos, with_labels=True, node_color=node_colors, node_size=2000, font_size=10, font_color='white',
-            font_weight='bold', arrowsize=20)
+    nx.draw(G, pos, with_labels=True, node_size=2000, font_size=10, font_color='white', font_weight='bold', arrows=True)
 
-    # Draw edges with different arrows for bidirectional connections
+    # Draw edges with different colors for the shortest path
     edge_labels = nx.get_edge_attributes(G, 'label')
     edge_colors = []
     for u, v, d in G.edges(data=True):
-        if d.get('bidirectional', False):
-            edge_colors.append('orange')  # Color for bidirectional edges
+        if shortest_path_edges and (u, v) in shortest_path_edges:
+            edge_colors.append('green')  # Color for shortest path edges
         else:
             edge_colors.append('black')  # Color for normal edges
 
@@ -82,23 +62,24 @@ def display_network_graph(connections_list):
     plt.show()
 
 
-# Load connections from JSON file
-
-
 # Periodically broadcast connections
 def broadcast_connections_periodically():
     while True:
-        time.sleep(600)  # Wait before broadcasting connections
+        time.sleep(6)  # Wait before broadcasting connections
 
         # Ensure that latency measurements are completed
-        print("Waiting for latency updates...")
+
         time.sleep(5)  # Additional wait to ensure latencies are updated
 
-        # Construct connection info with latency
-        connections_info = [f"{node}:{latencies[NODE_NAME].get(node, 'N/A')}" for node in
-                            accepted_connections[NODE_NAME]]
-        client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(connections_info)}")
-        print(f"Broadcasting connections with latency for node {NODE_NAME}")
+        # Check if there are connections to broadcast
+        if accepted_connections[NODE_NAME]:
+            # Construct connection info with latency
+            connections_info = [f"{node}:{latencies[NODE_NAME].get(node, 'N/A')}" for node in
+                                accepted_connections[NODE_NAME]]
+            client.publish(f"connections/{GATEWAY_NODE}", f"{NODE_NAME}:{','.join(connections_info)}")
+           # print(f"Broadcasting connections with latency for node {NODE_NAME}")
+        else:
+            print(f"No connections to broadcast for node {NODE_NAME}")
 
         # Wait for additional time to allow all nodes to process the broadcast
         time.sleep(5)
@@ -111,6 +92,10 @@ def add_local_connection(neighbor, latency):
         accepted_connections[neighbor].add(NODE_NAME)
         latencies[NODE_NAME][neighbor] = latency
         latencies[neighbor][NODE_NAME] = latency
+        if NODE_NAME not in connections_list:
+            connections_list[NODE_NAME] = []
+        if neighbor not in connections_list:
+            connections_list[neighbor] = []
         connections_list[NODE_NAME].append((neighbor, latency))
         connections_list[neighbor].append((NODE_NAME, latency))
         print(f"Added connection with {neighbor} with latency {latency}")
@@ -166,18 +151,43 @@ def handle_connection_acknowledgment(sender):
         print(f"Unexpected acknowledgment from {sender}")
 
 
+def handle_received_message(message):
+    # Implement the logic for handling the received message
+    print(f"Handling received message: {message}")
+
+    # Example: You might want to print the message, log it, or perform some action
+    # For instance, you can add logic to process or forward the message further
+    # You can also log it to a file or database if needed
+    with open('received_messages.log', 'a') as file:
+        file.write(f"{time.ctime()}: {message}\n")
+
+    # If needed, perform further processing of the message
+    # e.g., updating a database, triggering an event, etc.
+
+
 # Callback when a message is received
 def on_message(client, userdata, msg):
     global NEIGHBORS, latencies, connection_slots, accepted_connections, connections_list
     topic_parts = msg.topic.split('/')
 
-    if msg.payload.decode().startswith(NODE_NAME + ":"):
-        print(f"Ignoring loopback message: {msg.payload.decode()}")
-        return
 
     payload = msg.payload.decode()
 
-    if topic_parts[0] == 'connections' and topic_parts[1] == NODE_NAME:
+    if topic_parts[0] == 'message':
+        source_node, actual_message = payload.split(':', 1)
+        if topic_parts[1] == GATEWAY_NODE:
+            print(f"Message received from {source_node}: {actual_message}")
+            handle_received_message(actual_message)
+        elif topic_parts[1] == NODE_NAME:
+            forward_message_to_next_hop(actual_message)
+        else:
+            return
+
+    if topic_parts[0] == 'disconnect' and topic_parts[1] == 'all':
+        departed_node = payload
+        handle_node_departure(departed_node)
+
+    if topic_parts[0] == 'connections' and topic_parts[1] == GATEWAY_NODE:
         node, connections_info = payload.split(':', 1)
         connections_list[node] = []
         for info in connections_info.split(','):
@@ -198,6 +208,9 @@ def on_message(client, userdata, msg):
                 print(f"Warning: Info string does not contain ':': {info}")
         print(f"Received connections list with latency from {node}: {connections_list[node]}")
         save_connections_to_file()
+        if NODE_NAME == GATEWAY_NODE:
+            calculate_and_broadcast_next_hops()
+            print('calculating hops')
 
     elif topic_parts[0] == 'ping' and topic_parts[1] == NODE_NAME:
         client.publish(f"pong/{msg.payload.decode().split(':')[0]}",
@@ -223,123 +236,165 @@ def on_message(client, userdata, msg):
             accepted_connections[disconnected_node].remove(NODE_NAME)
             print(f"Disconnected from {disconnected_node}")
             client.publish(f"connections/{NODE_NAME}",
-                           f"{NODE_NAME}:{','.join([f'{n}:{latencies[NODE_NAME].get(n, 'N/A')}' for n in accepted_connections[NODE_NAME]])}")
+                           f"{NODE_NAME}:{','.join([f'{n}:{latencies[NODE_NAME].get(n)}' for n in accepted_connections[NODE_NAME]])}")
     elif topic_parts[0] == 'ack_request' and topic_parts[1] == NODE_NAME:
         handle_connection_acknowledgment(msg.payload.decode())
-    elif msg.topic == 'disconnect/all':
-        handle_gateway_disconnection(msg.payload.decode())
     elif topic_parts[0] == 'connections_request' and topic_parts[1] == NODE_NAME:
-        connections_info = [f"{node}:{latencies[NODE_NAME].get(node, 'N/A')}" for node in
-                            accepted_connections[NODE_NAME]]
-        client.publish(f"connections/{msg.payload.decode()}", f"{NODE_NAME}:{','.join(connections_info)}")
-    elif msg.topic == 'reset':
-        reset_connections()
-    else:
-        if ':' in payload:
-            parts = payload.split(':', 2)
-            sender = parts[0]
-            message = parts[1]
-            path_info = parts[2] if len(parts) > 2 else "NoPath"
-            if NODE_NAME == GATEWAY_NODE:
-                print(f"Gateway received message from {sender}: {message} with path {path_info}")
-                reset_connections()
-                broadcast_reset()
-            else:
-                print(f"Received message from {sender}: {message} with path {path_info} on topic {msg.topic}")
-                forward_message(client, sender, message)
+        if accepted_connections[NODE_NAME]:
+            connections_info = [f"{node}:{latencies[NODE_NAME].get(node)}" for node in
+                                accepted_connections[NODE_NAME]]
+            client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(connections_info)}")
+            print(f"Broadcasting connections for {NODE_NAME}")
         else:
-            print(f"Received malformed message: {payload}")
+            print(f"No connections to broadcast for {NODE_NAME}")
+
+    elif topic_parts[0] == 'next_hop' and topic_parts[1] == NODE_NAME:
+        global next_hop
+        next_hop = payload
+        print(f"Received next hop information: {next_hop}")
 
 
-
-
-# Function to forward messages based on the shortest path using Dijkstra's algorithm
-def forward_message(client, sender, message):
-    if GATEWAY_NODE in accepted_connections[NODE_NAME]:
-        # Path is empty when sending directly to the gateway
-        client.publish(GATEWAY_NODE, f"{NODE_NAME}:{message}:Path:")
-        print(f"Directly sent message to Gateway {GATEWAY_NODE} with path info")
+def recompute_shortest_paths():
+    path, G, pos = find_shortest_path_to_gateway()
+    if path:
+        print(f"Recomputed shortest path: {' -> '.join(path)}")
     else:
-        path = dijkstra(latencies, NODE_NAME, GATEWAY_NODE)
-        if path and len(path) > 0:
-            next_hop = path[1]
-            path_info = "->".join(path)
-            client.publish(next_hop, f"{NODE_NAME}:{message}:Path:{path_info}")
-            print(f"Sent message to {next_hop} (part of path to {GATEWAY_NODE}) with path info")
-            # Request connection list from next hop
-            client.publish(f"connections_request/{next_hop}", NODE_NAME)
-        else:
-            # Forward to the closest neighbor if no path to gateway is found
-            closest_neighbor = find_closest_neighbor()
-            if closest_neighbor:
-                client.publish(closest_neighbor, f"{NODE_NAME}:{message}:Path:NoPath")
-                print(f"Sent message to closest neighbor {closest_neighbor} as fallback with path info")
-                # Request connection list from closest neighbor
-                client.publish(f"connections_request/{closest_neighbor}", NODE_NAME)
-            else:
-                print(f"No path to gateway from {NODE_NAME} and no fallback neighbor found.")
+        print("No path found to the gateway after recomputing")
 
 
-def find_closest_neighbor():
-    min_latency = float('inf')
-    closest_neighbor = None
-    for neighbor in NEIGHBORS:
-        latency = latencies[NODE_NAME].get(neighbor, float('inf'))
-        if latency < min_latency:
-            min_latency = latency
-            closest_neighbor = neighbor
-    return closest_neighbor
+def handle_node_departure(departed_node):
+    print(f"Handling departure of node: {departed_node}")
+
+    # Check if the departed node is in the connections list
+    if departed_node in connections_list:
+        print(f"Node {departed_node} found in connections list. Removing...")
+        # Remove the departed node from the connections list
+        del connections_list[departed_node]
+    else:
+        print(f"Node {departed_node} not found in connections list.")
+
+    # Iterate through all remaining nodes in the connections list
+    for node, connections in list(connections_list.items()):
+        # Update the connections for each node by removing any that involve the departed node
+        updated_connections = [conn for conn in connections if conn[0] != departed_node]
+        if len(updated_connections) != len(connections):
+            print(f"Updating connections for node {node}.")
+        connections_list[node] = updated_connections
+
+    # Log the update
+    print(f"Updated connections list after {departed_node} departure: {connections_list}")
+
+    # Save the updated connections list to a file
+    save_connections_to_file()
+
+    # Recompute the shortest paths based on the updated connections list
+    recompute_shortest_paths()
 
 
-# Function to calculate the shortest path using Dijkstra's algorithm based on latency
-def dijkstra(graph, start, end):
-    queue = [(0, start, [])]
-    seen = set()
-    while queue:
-        (cost, node, path) = heapq.heappop(queue)
-        if node in seen:
-            continue
-        path = path + [node]
-        seen.add(node)
-        if node == end:
-            return path
-        for next_node, weight in graph.get(node, {}).items():
-            if next_node not in seen:
-                heapq.heappush(queue, (cost + weight, next_node, path))
-    return None
-
-
-# Save connections list to a file
 def save_connections_to_file():
-    with open('connections_list.json', 'w') as f:
-        json.dump(connections_list, f, indent=4)
-    print("Saved connections list with latency to 'connections_list.json'")
+    file_path = 'connections_list.json'
+    with open(file_path, 'w') as file:
+        json.dump(connections_list, file)
+    print(f"Connections saved to {file_path}")
 
 
-# Set up the MQTT client
+def load_connections_from_file():
+    file_path = 'connections_list.json'
+    try:
+        with open(file_path, 'r') as file:
+            connections = json.load(file)
+        print(f"Connections loaded from {file_path}")
+        # Ensure all nodes have an entry in connections_list
+        for node in [NODE_NAME, *connections.keys()]:
+            if node not in connections:
+                connections[node] = []
+        return connections
+    except FileNotFoundError:
+        print(f"{file_path} not found. Starting with an empty connections list.")
+        return defaultdict(list)
+
+
+# Connect to the MQTT broker
 client = mqtt.Client()
 client.on_message = on_message
-
-# Connect to the local MQTT broker
 client.connect(BROKER_IP, 1883, 60)
+client.subscribe(DISCOVERY_TOPIC)
+client.subscribe(f"connections/{NODE_NAME}")
+client.subscribe(f"ping/{NODE_NAME}")
+client.subscribe(f"pong/{NODE_NAME}")
+client.subscribe(f"disconnect/{NODE_NAME}")
+client.subscribe(f"ack_request/{NODE_NAME}")
+client.subscribe(f"next_hop/{NODE_NAME}")
+client.subscribe(f"message/{NODE_NAME}")
+client.subscribe('disconnect/all')
+client.subscribe(f"connections_request/{NODE_NAME}")
 
-# Subscribe to discovery, latency, and node-specific topics
-client.subscribe((DISCOVERY_TOPIC, 1))
-client.subscribe((f"ping/{NODE_NAME}", 1))
-client.subscribe((f"pong/{NODE_NAME}", 1))
-client.subscribe((NODE_NAME, 1))
-client.subscribe(('reset', 0))
-client.subscribe((f"ack_request/{NODE_NAME}", 1))
-client.subscribe((f"connections/{NODE_NAME}", 1))
-client.subscribe((f"connections_request/{NODE_NAME}", 1))
-if NODE_NAME == GATEWAY_NODE:
-    client.subscribe((GATEWAY_NODE, 0))
+# Start the periodic presence broadcasting in a separate thread
+presence_thread = threading.Thread(target=broadcast_presence)
+presence_thread.daemon = True
+presence_thread.start()
 
-# Start the loop to process incoming messages
+# Start the periodic connections broadcasting in a separate thread
+connections_broadcast_thread = threading.Thread(target=broadcast_connections_periodically)
+connections_broadcast_thread.daemon = True
+connections_broadcast_thread.start()
+
+# Load previously saved connections from file
+connections_list = load_connections_from_file()
+
+# Start the MQTT client loop
 client.loop_start()
 
 
-# Function to reset connections and discovery pings
+def broadcast_departure():
+    client.publish('disconnect/all', NODE_NAME)
+    print(f"Broadcasting departure for node {NODE_NAME}")
+
+
+# Function to find the shortest path to the gateway
+def find_shortest_path_to_gateway():
+    G = nx.Graph()
+    for node, connections in connections_list.items():
+        for neighbor, latency in connections:
+            G.add_edge(node, neighbor, weight=latency, label=f"{latency:.4f}")
+    pos = get_fixed_layout(G)
+
+    if nx.has_path(G, NODE_NAME, GATEWAY_NODE):
+        shortest_path = nx.shortest_path(G, source=NODE_NAME, target=GATEWAY_NODE, weight='weight')
+        print(f"Shortest path to the gateway ({GATEWAY_NODE}): {' -> '.join(shortest_path)}")
+        return shortest_path, G, pos
+    else:
+        print(f"No path found to the gateway ({GATEWAY_NODE}) from {NODE_NAME}")
+        return None, G, pos
+
+
+# Function to forward a message
+def forward_message_to_next_hop(message):
+    global next_hop
+    hop = next_hop
+    # Include the source node information in the message
+    full_message = f"{NODE_NAME}:{message}"
+    client.publish(f"message/{hop}", full_message)
+    print(f"Forwarded message to {hop}")
+
+
+def calculate_and_broadcast_next_hops():
+    G = nx.Graph()
+    for node, connections in connections_list.items():
+        for neighbor, latency in connections:
+            G.add_edge(node, neighbor, weight=latency, label=f"{latency:.4f}")
+    pos = get_fixed_layout(G)
+
+    if G.has_node(GATEWAY_NODE):
+        for node in G.nodes:
+            if node != GATEWAY_NODE:
+                if nx.has_path(G, node, GATEWAY_NODE):
+                    shortest_path = nx.shortest_path(G, source=node, target=GATEWAY_NODE, weight='weight')
+                    next_hop = shortest_path[1] if len(shortest_path) > 1 else GATEWAY_NODE
+                    client.publish(f"next_hop/{node}", next_hop)
+                    print(f"Sent next hop {next_hop} for node {node}")
+                else:
+                    print(f"No path found to the gateway ({GATEWAY_NODE}) from {node}")
 def reset_connections():
     global NEIGHBORS, latencies, connection_slots, accepted_connections, connections_list
     for neighbor in NEIGHBORS:
@@ -357,7 +412,7 @@ def reset_connections():
         connection_slots[neighbor] += 1
     accepted_connections[NODE_NAME] = set()
     connections_list = defaultdict(list)  # Reset connections list
-
+    save_connections_to_file()
     # Broadcast presence to allow reconnection
     client.publish(DISCOVERY_TOPIC, NODE_NAME)
     print("Reset connections and broadcasting presence.")
@@ -366,109 +421,45 @@ def reset_connections():
     time.sleep(1)
 
 
-# Handle the disconnection announcement from the gateway
-def handle_gateway_disconnection(node):
-    if node in NEIGHBORS:
-        NEIGHBORS.remove(node)
-        connection_slots[node] += 1
-        accepted_connections[node].remove(NODE_NAME)
-        print(f"Removed {node} from connections due to gateway disconnection.")
-        # Broadcast connections after removal
-        client.publish(f"connections/{NODE_NAME}", f"{NODE_NAME}:{','.join(accepted_connections[NODE_NAME])}")
+# Interactive loop to send messages or visualize the network
+def leave_network():
+    broadcast_departure()
+    client.loop_stop()
 
 
-# Function to send messages from the sender node
-def send_messages():
-    # Broadcast reset command on startup
-    broadcast_reset()
-    time.sleep(2)  # Allow time for nodes to reset their connections
-
-    while True:
-        message = input("Enter message to send (or 'show' to display connections, 'exit' to quit): ")
-        if message.lower() == 'exit':
-            break
-        elif message.lower() == 'show':
-            connections_list2 = load_connections_from_json('connections_list.json')
-
-            display_connections()
-            display_network_graph(connections_list2)
-        else:
-            # Broadcast presence to initiate connection process
-            broadcast_presence_once()
-            time.sleep(2)  # Allow time for nodes to connect and measure latency
-
-            # Wait for latency updates before checking path
-            print("Waiting for latency updates...")
-            time.sleep(5)  # Allow additional time for latency updates
-
-            # Check once if a path to the gateway exists
-            print("Checking for a path to the gateway...")
-            if path_exists_to_gateway():
-                print("Path to the gateway found.")
-                # Send the message once the path is established
-                client.publish(GATEWAY_NODE, f"{NODE_NAME}:{message}")
-                print(f"Sent message to Gateway: {message}")
-            else:
-                # Forward the message to the closest neighbor if no path to the gateway is found
-                closest_neighbor = find_closest_neighbor()
-                if closest_neighbor:
-                    client.publish(closest_neighbor, f"{NODE_NAME}:{message}")
-                    print(f"Sent message to closest neighbor {closest_neighbor} as fallback")
-                else:
-                    print(f"No path to gateway from {NODE_NAME} and no fallback neighbor found.")
-
-            time.sleep(2)
-            print("Ready for the next message.")
-            # Reset connections after sending the message
-            reset_connections()
-            print("Reset connections after sending the message.")
+# def forward_message(message):
+#     global next_hop
+#     path, G, pos = find_shortest_path_to_gateway()
+#     if path:
+#         forward_message_to_next_hop(next_hop, message)
+#     else:
+#         print(f"Cannot forward message, no path to gateway ({GATEWAY_NODE}) found.")
 
 
-def broadcast_presence_once():
-    if connection_slots[NODE_NAME] > 0:
-        client.publish(DISCOVERY_TOPIC, NODE_NAME)
-        print(f"Broadcasting presence: {NODE_NAME}")
-
-
-def display_connections():
-    print(f"Current accepted connections for node {NODE_NAME}:")
-    for node, connections in accepted_connections.items():
-        print(f"{node}: {', '.join(connections)}")
-
-
-def path_exists_to_gateway():
-    # Reconstruct the entire connection graph
-    full_graph = defaultdict(dict)
-    for node, connections in connections_list.items():
-        for neighbor in connections:
-            if neighbor in latencies[node]:
-                full_graph[node][neighbor] = latencies[node][neighbor]
-
-    path = dijkstra(full_graph, NODE_NAME, GATEWAY_NODE)
-    print(f"Path to gateway: {path}")
-    return path is not None
-
-
-# Start sending messages if this is the sender node
-send_messages_thread = threading.Thread(target=send_messages)
-send_messages_thread.start()
-
-# Start the presence broadcast in a separate thread
-broadcast_thread = threading.Thread(target=broadcast_presence)
-broadcast_thread.start()
-
-# Start the periodic connections broadcasting in a separate thread
-connections_broadcast_thread = threading.Thread(target=broadcast_connections_periodically)
-connections_broadcast_thread.start()
-
-# Keep the script running
 try:
     while True:
-        time.sleep(1)
+        user_input = input("Enter a command (send <message> / show / leave /  reset): ")
+        if user_input.startswith("send "):
+            message = user_input[5:]
+            forward_message_to_next_hop( message)
+        elif user_input == "show":
+            print(accepted_connections)
+            print(latencies)
+            print(connection_slots)
+            print(connections_list)
+            print(next_hop)
+            # _, G, pos = find_shortest_path_to_gateway()
+            # display_network_graph(G, pos)
+        elif user_input == "leave":
+            leave_network()
+
+        elif user_input == "reset" and NODE_NAME == GATEWAY_NODE:
+            reset_connections()
+        elif user_input == "exit":
+            break
 except KeyboardInterrupt:
-    client.loop_stop()
-    client.disconnect()
-    send_messages_thread.join()
-    broadcast_thread.join()
-    connections_broadcast_thread.join()
-    print("Disconnected from MQTT broker.")
+    leave_network()
+    print("Interrupted by user")
+
+# Clean up
+client.loop_stop()
