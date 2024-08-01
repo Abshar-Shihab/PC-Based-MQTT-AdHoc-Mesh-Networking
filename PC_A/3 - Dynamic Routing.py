@@ -1,14 +1,13 @@
 import paho.mqtt.client as mqtt
 import threading
 import time
-import heapq
 from collections import defaultdict
 import json
 import networkx as nx
 import matplotlib.pyplot as plt
 
 # Configuration
-BROKER_IP = '172.16.2.217'  # Local broker IP
+BROKER_IP = '172.16.2.130'  # Local broker IP
 DISCOVERY_TOPIC = 'discovery'
 NODE_NAME = 'K'  # Change this for each node ('D', 'S', 'N', 'K')
 GATEWAY_NODE = 'N'  # Specify the gateway node here
@@ -19,7 +18,8 @@ connection_slots = defaultdict(lambda: MAX_CONNECTIONS)  # Track available conne
 accepted_connections = defaultdict(set)  # Track accepted connections for each node
 connections_list = defaultdict(list)  # List to store connections for each node
 next_hop = None
-
+topology_algorithm = None
+connection_list_file = "connections_list.json"
 
 # Define a global layout for node positions
 def get_fixed_layout(G):
@@ -77,7 +77,7 @@ def broadcast_connections_periodically():
             connections_info = [f"{node}:{latencies[NODE_NAME].get(node, 'N/A')}" for node in
                                 accepted_connections[NODE_NAME]]
             client.publish(f"connections/{GATEWAY_NODE}", f"{NODE_NAME}:{','.join(connections_info)}")
-           # print(f"Broadcasting connections with latency for node {NODE_NAME}")
+        # print(f"Broadcasting connections with latency for node {NODE_NAME}")
         else:
             print(f"No connections to broadcast for node {NODE_NAME}")
 
@@ -170,7 +170,6 @@ def on_message(client, userdata, msg):
     global NEIGHBORS, latencies, connection_slots, accepted_connections, connections_list
     topic_parts = msg.topic.split('/')
 
-
     payload = msg.payload.decode()
 
     if topic_parts[0] == 'message':
@@ -179,7 +178,7 @@ def on_message(client, userdata, msg):
             print(f"Message received from {source_node}: {actual_message}")
             handle_received_message(actual_message)
         elif topic_parts[1] == NODE_NAME:
-            forward_message_to_next_hop(actual_message)
+            forward_message_to_next_hop(actual_message, source_node)
         else:
             return
 
@@ -290,7 +289,6 @@ def handle_node_departure(departed_node):
     # Recompute the shortest paths based on the updated connections list
     recompute_shortest_paths()
 
-
 def save_connections_to_file():
     file_path = 'connections_list.json'
     with open(file_path, 'w') as file:
@@ -316,7 +314,7 @@ def load_connections_from_file():
 
 # Connect to the MQTT broker
 client = mqtt.Client()
-client.on_message = on_message
+
 client.connect(BROKER_IP, 1883, 60)
 client.subscribe(DISCOVERY_TOPIC)
 client.subscribe(f"connections/{NODE_NAME}")
@@ -340,7 +338,7 @@ connections_broadcast_thread.daemon = True
 connections_broadcast_thread.start()
 
 # Load previously saved connections from file
-connections_list = load_connections_from_file()
+# connections_list = load_connections_from_file()
 
 # Start the MQTT client loop
 client.loop_start()
@@ -354,10 +352,17 @@ def broadcast_departure():
 # Function to find the shortest path to the gateway
 def find_shortest_path_to_gateway():
     G = nx.Graph()
+    G.add_node(NODE_NAME)
+    print("Building graph with nodes:")
     for node, connections in connections_list.items():
+        print(f"Node: {node}, Connections: {connections}")
         for neighbor, latency in connections:
             G.add_edge(node, neighbor, weight=latency, label=f"{latency:.4f}")
+
     pos = get_fixed_layout(G)
+
+    print(f"Graph nodes: {list(G.nodes)}")
+    print(f"Graph edges: {list(G.edges)}")
 
     if nx.has_path(G, NODE_NAME, GATEWAY_NODE):
         shortest_path = nx.shortest_path(G, source=NODE_NAME, target=GATEWAY_NODE, weight='weight')
@@ -368,33 +373,75 @@ def find_shortest_path_to_gateway():
         return None, G, pos
 
 
+
+
 # Function to forward a message
-def forward_message_to_next_hop(message):
+def forward_message_to_next_hop(message, source):
     global next_hop
     hop = next_hop
     # Include the source node information in the message
-    full_message = f"{NODE_NAME}:{message}"
+    full_message = f"{source}:{message}"
     client.publish(f"message/{hop}", full_message)
     print(f"Forwarded message to {hop}")
-
-
-def calculate_and_broadcast_next_hops():
+def calculate_shortest_paths_dijkstra(connections_list, start_node):
+    # Build the graph from connections_list
     G = nx.Graph()
     for node, connections in connections_list.items():
         for neighbor, latency in connections:
-            G.add_edge(node, neighbor, weight=latency, label=f"{latency:.4f}")
-    pos = get_fixed_layout(G)
+            G.add_edge(node, neighbor, weight=latency, label=f'{latency:.2f}')
+    # Calculate shortest paths
+    shortest_paths = nx.single_source_dijkstra_path(G, start_node, weight='weight')
+    shortest_path_edges = set()
+    for target_node, path in shortest_paths.items():
+        for i in range(len(path) - 1):
+            shortest_path_edges.add((path[i], path[i + 1]))
+    return shortest_paths, shortest_path_edges
 
-    if G.has_node(GATEWAY_NODE):
-        for node in G.nodes:
-            if node != GATEWAY_NODE:
-                if nx.has_path(G, node, GATEWAY_NODE):
-                    shortest_path = nx.shortest_path(G, source=node, target=GATEWAY_NODE, weight='weight')
-                    next_hop = shortest_path[1] if len(shortest_path) > 1 else GATEWAY_NODE
-                    client.publish(f"next_hop/{node}", next_hop)
-                    print(f"Sent next hop {next_hop} for node {node}")
-                else:
-                    print(f"No path found to the gateway ({GATEWAY_NODE}) from {node}")
+def calculate_shortest_paths_bellman_ford(connections_list, start_node):
+    # Build the graph from connections_list
+    G = nx.DiGraph()
+    for node, connections in connections_list.items():
+        for neighbor, latency in connections:
+            G.add_edge(node, neighbor, weight=latency, label=f'{latency:.2f}')
+    # Calculate shortest paths
+    shortest_paths = nx.single_source_bellman_ford_path(G, start_node, weight='weight')
+    shortest_path_edges = set()
+    for target_node, path in shortest_paths.items():
+        for i in range(len(path) - 1):
+            shortest_path_edges.add((path[i], path[i + 1]))
+    return shortest_paths, shortest_path_edges
+
+
+def calculate_and_broadcast_next_hops():
+    global next_hop, topology_algorithm
+    if not connections_list:
+        print("No connections available for calculating shortest paths.")
+        return
+    if topology_algorithm == 'dijkstra':
+        shortest_paths, shortest_path_edges = calculate_shortest_paths_dijkstra(connections_list, GATEWAY_NODE)
+    elif topology_algorithm == 'bellman_ford':
+        shortest_paths, shortest_path_edges = calculate_shortest_paths_bellman_ford(connections_list, GATEWAY_NODE)
+    else:
+        print(f"Unknown topology algorithm: {topology_algorithm}")
+        return
+
+    if NODE_NAME in shortest_paths:
+        path = shortest_paths[NODE_NAME]
+        if len(path) > 1:
+            next_hop = path[1]
+            print(f"Next hop for {NODE_NAME} is {next_hop}")
+
+    # Build the graph from connections_list
+    G = nx.Graph()
+    for node, connections in connections_list.items():
+        for neighbor, latency in connections:
+            G.add_edge(node, neighbor, weight=latency, label=f'{latency:.2f}')
+
+    # Display the network graph
+    pos = get_fixed_layout(G)
+    # display_network_graph(G, pos, shortest_path_edges)
+
+
 def reset_connections():
     global NEIGHBORS, latencies, connection_slots, accepted_connections, connections_list
     for neighbor in NEIGHBORS:
@@ -434,32 +481,57 @@ def leave_network():
 #         forward_message_to_next_hop(next_hop, message)
 #     else:
 #         print(f"Cannot forward message, no path to gateway ({GATEWAY_NODE}) found.")
+def select_topology_algorithm():
+    global topology_algorithm
+    print("Select the topology algorithm:")
+    print("1. Dijkstra")
+    print("2. Bellman-Ford")
+    choice = input("Enter your choice (1 or 2): ")
+    if choice == '1':
+        topology_algorithm = 'dijkstra'
+    elif choice == '2':
+        topology_algorithm = 'bellman_ford'
+    else:
+        print("Invalid choice. Using Dijkstra as the default algorithm.")
+        topology_algorithm = 'dijkstra'
 
 
 try:
+    # Select the topology algorithm at the start
+    if NODE_NAME == GATEWAY_NODE:
+        select_topology_algorithm()
     while True:
+        client.on_message = on_message
         user_input = input("Enter a command (send <message> / show / leave /  reset): ")
         if user_input.startswith("send "):
             message = user_input[5:]
-            forward_message_to_next_hop( message)
+            forward_message_to_next_hop(message, NODE_NAME)
+            print("Message forwarded to ", next_hop)
         elif user_input == "show":
             print(accepted_connections)
             print(latencies)
             print(connection_slots)
             print(connections_list)
             print(next_hop)
-            # _, G, pos = find_shortest_path_to_gateway()
-            # display_network_graph(G, pos)
+            _, G, pos = find_shortest_path_to_gateway()
+            display_network_graph(G, pos)
         elif user_input == "leave":
             leave_network()
-
+            with open(connection_list_file, 'w') as f:
+                json.dump({}, f)
+            break
         elif user_input == "reset" and NODE_NAME == GATEWAY_NODE:
             reset_connections()
         elif user_input == "exit":
+            with open(connection_list_file, 'w') as f:
+                json.dump({}, f)
             break
 except KeyboardInterrupt:
     leave_network()
+    with open(connection_list_file, 'w') as f:
+        f.truncate()
     print("Interrupted by user")
+
 
 # Clean up
 client.loop_stop()
